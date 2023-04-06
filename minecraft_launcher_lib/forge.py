@@ -1,0 +1,248 @@
+"""
+.. note::
+    Before using this module, please read this comment from the forge developers:
+
+    .. code:: text
+
+        Please do not automate the download and installation of Forge.
+        Our efforts are supported by ads from the download page.
+        If you MUST automate this, please consider supporting the project through https://www.patreon.com/LexManos/
+
+    It's your choice, if you want to respect that and support forge.
+
+forge contains functions for dealing with the Forge modloader
+"""
+from ._helper import download_file, get_library_path, get_jar_mainclass, parse_maven_metadata, empty, extract_file_from_zip, get_classpath_separator
+from .install import install_minecraft_version, install_libraries
+from ._internal_types.forge_types import ForgeInstallProfile
+from typing import List, Union, Optional
+from .exceptions import VersionNotFound
+from .types import CallbackDict
+import subprocess
+import tempfile
+import random
+import zipfile
+import shutil
+import json
+import os
+
+__all__ = ["install_forge_version", "run_forge_installer", "list_forge_versions", "find_forge_version", "is_forge_version_valid", "supports_automatic_install"]
+
+
+def get_data_library_path(libname: str, path: str) -> str:
+    """
+    Turns the libname into a path
+    """
+    # Remove the []
+    libname = libname[1:-1]
+    libpath = os.path.join(path, "libraries")
+    base_path, libname, version, extra = libname.split(":")
+    for i in base_path.split("."):
+        libpath = os.path.join(libpath, i)
+    try:
+        extra, fileend = extra.split("@")
+    except ValueError:
+        fileend = "jar"
+    libpath = os.path.join(libpath, libname, version, f"{libname}-{version}-{extra}.{fileend}")
+    return libpath
+
+
+def forge_processors(data: ForgeInstallProfile, minecraft_directory: Union[str, os.PathLike], lzma_path: str, installer_path: str, callback: CallbackDict, java: str) -> None:
+    """
+    Run the processors of the install_profile.json
+    """
+    path = str(minecraft_directory)
+
+    argument_vars = {"{MINECRAFT_JAR}": os.path.join(path, "versions", data["minecraft"], data["minecraft"] + ".jar")}
+    for data_key, data_value in data["data"].items():
+        if data_value["client"].startswith("[") and data_value["client"].endswith("]"):
+            argument_vars["{" + data_key + "}"] = get_data_library_path(data_value["client"], path)
+        else:
+            argument_vars["{" + data_key + "}"] = data_value["client"]
+
+    root_path = os.path.join(tempfile.gettempdir(), "forge-root-" + str(random.randrange(1, 100000)))
+    argument_vars["{INSTALLER}"] = installer_path
+    argument_vars["{BINPATCH}"] = lzma_path
+    argument_vars["{ROOT}"] = root_path
+    argument_vars["{SIDE}"] = "client"
+
+    classpath_seperator = get_classpath_separator()
+
+    callback.get("setMax", empty)(len(data["processors"]))
+
+    for count, i in enumerate(data["processors"]):
+        if "client" not in i.get("sides", ["client"]):
+            # Skip server side only processors
+            continue
+        callback.get("setStatus", empty)("Running processor " + i["jar"])
+        # Get the classpath
+        classpath = ""
+        for c in i["classpath"]:
+            classpath = classpath + get_library_path(c, path) + classpath_seperator
+        classpath = classpath + get_library_path(i["jar"], path)
+        mainclass = get_jar_mainclass(get_library_path(i["jar"], path))
+        command = [java, "-cp", classpath, mainclass]
+        for c in i["args"]:
+            var = argument_vars.get(c, c)
+            if var.startswith("[") and var.endswith("]"):
+                command.append(get_library_path(var[1:-1], path))
+            else:
+                command.append(var)
+        for argument_key, argument_value in argument_vars.items():
+            for pos in range(len(command)):
+                command[pos] = command[pos].replace(argument_key, argument_value)
+        subprocess.call(command)
+        callback.get("setProgress", empty)(count)
+
+    if os.path.exists(root_path):
+        shutil.rmtree(root_path)
+
+
+def install_forge_version(versionid: str, path: Union[str, os.PathLike], callback: Optional[CallbackDict] = None, java: Optional[Union[str, os.PathLike]] = None) -> None:
+    """
+    Installs the given Forge version
+
+    :param versionid: A Forge Version. You can get a List of Forge versions using :func:`list_forge_versions`
+    :param path: The path to your Minecraft directory
+    :param callback: The same dict as for :func:`~minecraft_launcher_lib.install.install_minecraft_version`
+    :param java: A Path to a custom Java executable
+
+    Raises a :class:`~minecraft_launcher_lib.exceptions.VersionNotFound` exception when the given forge version is not found
+    """
+    if callback is None:
+        callback = {}
+
+    FORGE_DOWNLOAD_URL = "https://files.minecraftforge.net/maven/net/minecraftforge/forge/{version}/forge-{version}-installer.jar"
+    temp_file_path = os.path.join(tempfile.gettempdir(), "forge-installer-" + str(random.randrange(1, 100000)) + ".tmp")
+
+    if not download_file(FORGE_DOWNLOAD_URL.format(version=versionid), temp_file_path, callback):
+        raise VersionNotFound(versionid)
+
+    zf = zipfile.ZipFile(temp_file_path, "r")
+
+    # Read the install_profile.json
+    with zf.open("install_profile.json", "r") as f:
+        version_content = f.read()
+
+    version_data: ForgeInstallProfile = json.loads(version_content)
+    forge_version_id = version_data["version"]
+
+    # Make sure, the base version is installed
+    install_minecraft_version(version_data["minecraft"], path, callback=callback)
+
+    # Install all needed libs from install_profile.json
+    install_libraries(version_data["minecraft"], version_data["libraries"], str(path), callback)
+
+    # Extract the version.json
+    version_json_path = os.path.join(path, "versions", forge_version_id, forge_version_id + ".json")
+    extract_file_from_zip(zf, "version.json", version_json_path, minecraft_directory=path)
+
+    # Extract forge libs from the installer
+    forge_lib_path = os.path.join(path, "libraries", "net", "minecraftforge", "forge", versionid)
+    try:
+        extract_file_from_zip(zf, "maven/net/minecraftforge/forge/{version}/forge-{version}.jar".format(version=versionid), os.path.join(forge_lib_path, "forge-" + versionid + ".jar"), minecraft_directory=path)
+        extract_file_from_zip(zf, "maven/net/minecraftforge/forge/{version}/forge-{version}-universal.jar".format(version=versionid), os.path.join(forge_lib_path, "forge-" + versionid + "-universal.jar"), minecraft_directory=path)
+    except KeyError:
+        pass
+
+    # Extract the client.lzma
+    lzma_path = os.path.join(tempfile.gettempdir(), "lzma-" + str(random.randrange(1, 100000)) + ".tmp")
+    try:
+        extract_file_from_zip(zf, "data/client.lzma", lzma_path, minecraft_directory=path)
+    except KeyError:
+        pass
+
+    zf.close()
+
+    # Install the rest with the vanilla function
+    install_minecraft_version(forge_version_id, str(path), callback=callback)
+
+    # Run the processors
+    forge_processors(version_data, str(path), lzma_path, temp_file_path, callback, "java" if java is None else str(java))
+
+    # Delete the temporary files
+    os.remove(temp_file_path)
+    if os.path.isfile(lzma_path):
+        os.remove(lzma_path)
+
+
+def run_forge_installer(version: str, java: Optional[Union[str, os.PathLike]] = None) -> None:
+    """
+    Run the forge installer of the given forge version
+
+    :param version: A Forge Version. You can get a List of Forge versions using :func:`list_forge_versions`
+    :param java: A Path to a custom Java executable
+    """
+    FORGE_DOWNLOAD_URL = "https://files.minecraftforge.net/maven/net/minecraftforge/forge/{version}/forge-{version}-installer.jar"
+    temp_file_path = os.path.join(tempfile.gettempdir(), "forge-" + str(random.randrange(1, 100000)) + ".tmp")
+
+    if not download_file(FORGE_DOWNLOAD_URL.format(version=version), temp_file_path, {}):
+        raise VersionNotFound(version)
+
+    subprocess.call(["java" if java is None else str(java), "-jar", temp_file_path])
+    os.remove(temp_file_path)
+
+
+def list_forge_versions() -> List[str]:
+    """
+    Returns a list of all forge versions
+    """
+    MAVEN_METADATA_URL = "https://files.minecraftforge.net/maven/net/minecraftforge/forge/maven-metadata.xml"
+    return parse_maven_metadata(MAVEN_METADATA_URL)["versions"]
+
+
+def find_forge_version(vanilla_version: str) -> Optional[str]:
+    """
+    Find the latest forge version that is compatible to the given vanilla version
+
+    :param vanilla_version: A vanilla Minecraft version
+    """
+    version_list = list_forge_versions()
+    for i in version_list:
+        version_split = i.split("-")
+        if version_split[0] == vanilla_version:
+            return i
+    return None
+
+
+def is_forge_version_valid(forge_version: str) -> bool:
+    """
+    Checks if a forge version is valid
+
+    :param forge_version: A Forge Version
+    """
+    forge_version_list = list_forge_versions()
+    return forge_version in forge_version_list
+
+
+def supports_automatic_install(forge_version: str) -> bool:
+    """
+    Checks if install_forge_version() supports the given forge version
+
+    :param forge_version: A Forge Version
+    """
+    try:
+        vanilla_version, forge = forge_version.split("-")
+        version_split = vanilla_version.split(".")
+        version_number = int(version_split[1])
+        if version_number >= 13:
+            return True
+        else:
+            return False
+    except Exception:
+        return False
+
+
+def forge_to_installed_version(forge_version: str) -> str:
+    """
+    Returns the Version under which Forge will be installed from the given Forge version.
+
+    :param forge_version: A Forge Version
+
+    Raises a ValueError if the Version is invalid.
+    """
+    try:
+        vanilla_part, forge_part = forge_version.split("-")
+        return f"{vanilla_part}-forge-{forge_part}"
+    except ValueError:
+        raise ValueError(f"{forge_version} is not a valid forge version") from None

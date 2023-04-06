@@ -1,0 +1,1 @@
+pyinstaller --noconfirm --onefile --windowed --icon "C:/Users/rinka/Desktop/RNLauncher/logo.ico" --name "RNLauncher" --add-data "C:/Users/rinka/Desktop/RNLauncher/minecraft_launcher_lib;minecraft_launcher_lib/" --add-data "C:/Users/rinka/Desktop/RNLauncher/logo.png;.logo.png"  "C:/Users/rinka/Desktop/RNLauncher/main.py"
